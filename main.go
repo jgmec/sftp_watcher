@@ -386,46 +386,32 @@ func extractLocalZip(ctx context.Context, localPath, zipName string, lineCh chan
 	return nil
 }
 
-// decodeFile streams ALL JSON objects from an io.Reader using
-// json.NewDecoder and decoder.More(). It does NOT check ctx between
-// individual objects — it finishes the entire file to avoid partial
-// processing. Only the hard deadline (ctx cancellation) can interrupt it,
-// and that only happens between sends to lineCh.
+// decodeFile streams individual JSON objects from an io.Reader where each
+// line is a separate JSON object (NDJSON / JSON Lines format).
+// Uses json.NewDecoder and decoder.More() to read objects one by one.
+// Returns the number of objects decoded.
 func decodeFile(ctx context.Context, zipName, fileName string, file io.Reader, lineCh chan<- LineRecord) (int, error) {
 	decoder := json.NewDecoder(file)
 	lineNo := 0
 
-	tok, err := decoder.Token()
-	if err != nil {
-		return 0, fmt.Errorf("read first token: %w", err)
-	}
-
-	if delim, ok := tok.(json.Delim); ok && delim == '[' {
-		for decoder.More() {
-			var raw json.RawMessage
-			if err := decoder.Decode(&raw); err != nil {
-				return lineNo, fmt.Errorf("decode object #%d: %w", lineNo+1, err)
-			}
-			lineNo++
-
-			// Send to lineCh; only the hard deadline can interrupt.
-			select {
-			case <-ctx.Done():
-				return lineNo, fmt.Errorf("hard deadline after %d objects: %w", lineNo, ctx.Err())
-			case lineCh <- LineRecord{
-				ZipName:  zipName,
-				FileName: fileName,
-				LineNo:   lineNo,
-				Line:     string(raw),
-			}:
-			}
+	for decoder.More() {
+		var raw json.RawMessage
+		if err := decoder.Decode(&raw); err != nil {
+			return lineNo, fmt.Errorf("decode object #%d: %w", lineNo+1, err)
 		}
+		lineNo++
 
-		if _, err := decoder.Token(); err != nil {
-			return lineNo, fmt.Errorf("read closing bracket: %w", err)
+		// Send to lineCh; only the hard deadline can interrupt.
+		select {
+		case <-ctx.Done():
+			return lineNo, fmt.Errorf("hard deadline after %d objects: %w", lineNo, ctx.Err())
+		case lineCh <- LineRecord{
+			ZipName:  zipName,
+			FileName: fileName,
+			LineNo:   lineNo,
+			Line:     string(raw),
+		}:
 		}
-	} else {
-		log.Printf("[decode] %s/%s: expected JSON array, got token %v — skipping", zipName, fileName, tok)
 	}
 
 	return lineNo, nil
