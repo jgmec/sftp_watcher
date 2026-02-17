@@ -1,0 +1,88 @@
+
+services:
+  # --------------------------------------------------------------------------
+  # ClickHouse
+  # --------------------------------------------------------------------------
+  clickhouse:
+    image: clickhouse/clickhouse-server:24.3-alpine
+    container_name: clickhouse
+    ports:
+      - "8123:8123"   # HTTP interface
+      - "9000:9000"   # Native TCP protocol
+    volumes:
+      - clickhouse-data:/var/lib/clickhouse
+      - clickhouse-logs:/var/log/clickhouse-server
+    environment:
+      CLICKHOUSE_DB: default
+      CLICKHOUSE_USER: default
+      CLICKHOUSE_PASSWORD: ""
+      CLICKHOUSE_DEFAULT_ACCESS_MANAGEMENT: 1
+    ulimits:
+      nofile:
+        soft: 262144
+        hard: 262144
+    healthcheck:
+      test: ["CMD", "clickhouse-client", "--query", "SELECT 1"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+    restart: unless-stopped
+
+  # --------------------------------------------------------------------------
+  # SFTP server (for local development / testing)
+  # --------------------------------------------------------------------------
+  sftp:
+    image: atmoz/sftp:alpine
+    container_name: sftp
+    ports:
+      - "2222:22"
+    volumes:
+      - sftp-data:/home/user/upload
+    command: "user:secret:::upload"
+    restart: unless-stopped
+
+  # --------------------------------------------------------------------------
+  # Zip Watcher App
+  # --------------------------------------------------------------------------
+  app:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: sftp-zip-watcher
+    depends_on:
+      clickhouse:
+        condition: service_healthy
+      sftp:
+        condition: service_started
+    environment:
+      # SFTP — points to the sftp container
+      SFTP_HOST: sftp
+      SFTP_PORT: "22"
+      SFTP_USER: user
+      SFTP_PASSWORD: secret
+      SFTP_WATCH_DIR: /upload
+
+      # Local temp dir inside the container
+      LOCAL_DIR: /tmp/sftp-zips
+
+      # ClickHouse — points to the clickhouse container
+      CH_HOST: clickhouse
+      CH_PORT: "9000"
+      CH_DATABASE: default
+      CH_TABLE: zip_lines
+      CH_USER: default
+      CH_PASSWORD: ""
+
+      # Processing
+      POLL_INTERVAL: "10s"
+      LINE_CHANNEL_SIZE: "2000"
+      BATCH_SIZE: "1000"
+      NUM_WORKERS: "4"
+      SHUTDOWN_TIMEOUT: "30s"
+    restart: unless-stopped
+    stop_grace_period: 35s   # > SHUTDOWN_TIMEOUT so the app can drain
+
+volumes:
+  clickhouse-data:
+  clickhouse-logs:
+  sftp-data:
