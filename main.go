@@ -507,8 +507,8 @@ func insertWorker(
 //      - closes lineCh
 //   3. insert workers drain lineCh until closed, flush remaining batches
 //   4. wg.Wait() returns → clean exit
-//   5. If all of the above takes longer than ShutdownTimeout, hardCtx
-//      fires and everything is force-stopped.
+//   5. Workers continue draining lineCh with no fixed timeout
+//   6. If draining takes longer than 5 minutes, hardCtx fires as emergency safeguard
 // ---------------------------------------------------------------------------
 
 func main() {
@@ -526,15 +526,9 @@ func main() {
 	signal.Notify(sig, syscall.SIGINT, syscall.SIGTERM)
 	go func() {
 		s := <-sig
-		log.Printf("[main] received %v — graceful shutdown (timeout %s)", s, cfg.ShutdownTimeout)
+		log.Printf("[main] received %v — graceful shutdown (waiting for lineCh to drain)", s)
 		shuttingDown.Store(1)
 		stopCancel()
-
-		// Start hard deadline timer.
-		time.AfterFunc(cfg.ShutdownTimeout, func() {
-			log.Println("[main] shutdown timeout exceeded — forcing exit")
-			hardCancel()
-		})
 
 		// Second signal → immediate exit.
 		s = <-sig
@@ -583,14 +577,31 @@ func main() {
 		go insertWorker(hardCtx, i, conn, cfg, lineCh, &workerWg)
 	}
 
-	log.Printf("[main] pipeline running — poll=%s workers=%d batch=%d lineBuf=%d timeout=%s",
-		cfg.PollInterval, cfg.NumWorkers, cfg.BatchSize, cfg.LineChannelSize, cfg.ShutdownTimeout)
+	log.Printf("[main] pipeline running — poll=%s workers=%d batch=%d lineBuf=%d",
+		cfg.PollInterval, cfg.NumWorkers, cfg.BatchSize, cfg.LineChannelSize)
 
 	// Wait for watcher to finish (it closes lineCh when done).
 	wg.Wait()
 	log.Println("[main] watcher done, waiting for workers to drain lineCh...")
 
 	// Wait for workers to drain and flush.
-	workerWg.Wait()
-	log.Println("[main] all workers done — shutdown complete")
+	// Workers will keep consuming from lineCh until it's empty, regardless of time.
+	// Use a long hard deadline only as an emergency safeguard.
+	done := make(chan struct{})
+	go func() {
+		workerWg.Wait()
+		close(done)
+	}()
+
+	hardDeadline := time.NewTimer(5 * time.Minute)
+	select {
+	case <-done:
+		log.Println("[main] all workers done — shutdown complete")
+		hardDeadline.Stop()
+	case <-hardDeadline.C:
+		log.Println("[main] worker drain exceeded hard deadline (5 min) — forcing exit")
+		hardCancel()
+		<-done
+		log.Println("[main] workers stopped after hard deadline")
+	}
 }
