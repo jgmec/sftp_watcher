@@ -12,6 +12,7 @@ import (
 	"path/filepath"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"syscall"
 	"time"
 
@@ -43,13 +44,14 @@ type Config struct {
 	CHPassword string
 
 	// Local
-	LocalDir string // local directory to download zips into
+	LocalDir string
 
 	// Processing
 	PollInterval    time.Duration
-	LineChannelSize int // buffered channel for LineRecord (≥ BatchSize)
-	BatchSize       int // rows per ClickHouse batch
+	LineChannelSize int
+	BatchSize       int
 	NumWorkers      int
+	ShutdownTimeout time.Duration // hard deadline for graceful drain
 }
 
 func loadConfig() Config {
@@ -71,9 +73,10 @@ func loadConfig() Config {
 		LocalDir: envOr("LOCAL_DIR", "/tmp/sftp-zips"),
 
 		PollInterval:    mustDuration(envOr("POLL_INTERVAL", "10s")),
-		LineChannelSize: atoi(envOr("LINE_CHANNEL_SIZE", "2000")), // 2× batch to keep workers fed
+		LineChannelSize: atoi(envOr("LINE_CHANNEL_SIZE", "2000")),
 		BatchSize:       atoi(envOr("BATCH_SIZE", "1000")),
 		NumWorkers:      atoi(envOr("NUM_WORKERS", "4")),
+		ShutdownTimeout: mustDuration(envOr("SHUTDOWN_TIMEOUT", "30s")),
 	}
 }
 
@@ -109,7 +112,7 @@ type LineRecord struct {
 	ZipName  string
 	FileName string
 	LineNo   int
-	Line     string // JSON-encoded object as string
+	Line     string
 }
 
 // ---------------------------------------------------------------------------
@@ -154,8 +157,6 @@ func ensureTable(ctx context.Context, conn driver.Conn, cfg Config) error {
 	return conn.Exec(ctx, ddl)
 }
 
-// sendBatch uses the native clickhouse-go PrepareBatch API for high-throughput
-// columnar inserts. Each call sends exactly one batch of up to BatchSize rows.
 func sendBatch(ctx context.Context, conn driver.Conn, cfg Config, rows []LineRecord) error {
 	if len(rows) == 0 {
 		return nil
@@ -228,66 +229,6 @@ func newSFTPClient(cfg Config) (*sftp.Client, *ssh.Client, error) {
 	return sc, sshConn, nil
 }
 
-// ---------------------------------------------------------------------------
-// Pipeline Stage 1: Watch SFTP → download → zip.OpenReader → json.NewDecoder → lineCh
-// ---------------------------------------------------------------------------
-
-func watchZips(ctx context.Context, cfg Config, sc *sftp.Client, lineCh chan<- LineRecord) {
-	defer close(lineCh)
-
-	// Ensure local download directory exists.
-	if err := os.MkdirAll(cfg.LocalDir, 0o755); err != nil {
-		log.Fatalf("[watch] create local dir %s: %v", cfg.LocalDir, err)
-	}
-
-	ticker := time.NewTicker(cfg.PollInterval)
-	defer ticker.Stop()
-
-	poll := func() {
-		entries, err := sc.ReadDir(cfg.SFTPWatchDir)
-		if err != nil {
-			log.Printf("[watch] readdir: %v", err)
-			return
-		}
-		for _, e := range entries {
-			name := e.Name()
-			if e.IsDir() || !strings.HasSuffix(strings.ToLower(name), ".zip") {
-				continue
-			}
-
-			log.Printf("[watch] new zip: %s", name)
-
-			remotePath := filepath.Join(cfg.SFTPWatchDir, name)
-			localPath := filepath.Join(cfg.LocalDir, name)
-
-			// Step 1: Download zip from SFTP to local file.
-			if err := downloadFile(sc, remotePath, localPath); err != nil {
-				log.Printf("[watch] download %s: %v", name, err)
-				continue
-			}
-			log.Printf("[watch] downloaded %s → %s", remotePath, localPath)
-
-			// Step 2: Open local zip, stream JSON from each file into lineCh.
-			if err := extractLocalZip(ctx, localPath, name, lineCh); err != nil {
-				log.Printf("[watch] extract %s: %v", name, err)
-				os.Remove(localPath)
-			}
-		}
-	}
-
-	poll()
-	for {
-		select {
-		case <-ctx.Done():
-			log.Println("[watch] shutdown")
-			return
-		case <-ticker.C:
-			poll()
-		}
-	}
-}
-
-// downloadFile transfers a remote SFTP file to a local path.
 func downloadFile(sc *sftp.Client, remotePath, localPath string) error {
 	remote, err := sc.Open(remotePath)
 	if err != nil {
@@ -307,20 +248,101 @@ func downloadFile(sc *sftp.Client, remotePath, localPath string) error {
 		return fmt.Errorf("copy: %w", err)
 	}
 
-	remote.Close()
-	err = sc.Remove(remotePath)
-	if err != nil {
-		return fmt.Errorf("[download] remove remote %s: %v", remotePath, err)
-	}
-
 	log.Printf("[download] %s → %s (%d bytes)", remotePath, localPath, n)
 	return nil
 }
 
+// ---------------------------------------------------------------------------
+// Pipeline Stage 1: Watch SFTP → download → zip.OpenReader → json.NewDecoder → lineCh
+//
+// Graceful shutdown strategy:
+//   - stopCtx is cancelled by signal → watcher stops polling for NEW zips
+//   - The current zip being processed is ALWAYS finished completely
+//     (all files in the zip, all JSON objects in each file)
+//   - Only after the current zip is fully drained does the watcher close lineCh
+//   - hardCtx is a deadline that force-kills everything if drain takes too long
+// ---------------------------------------------------------------------------
+
+// shuttingDown is set to 1 when the signal is received. The watcher checks
+// this between zips to decide whether to stop picking up new ones.
+var shuttingDown atomic.Int32
+
+func watchZips(ctx context.Context, hardCtx context.Context, cfg Config, sc *sftp.Client, lineCh chan<- LineRecord) {
+	defer close(lineCh)
+
+	if err := os.MkdirAll(cfg.LocalDir, 0o755); err != nil {
+		log.Fatalf("[watch] create local dir %s: %v", cfg.LocalDir, err)
+	}
+
+	seen := make(map[string]struct{})
+	ticker := time.NewTicker(cfg.PollInterval)
+	defer ticker.Stop()
+
+	poll := func() {
+		entries, err := sc.ReadDir(cfg.SFTPWatchDir)
+		if err != nil {
+			log.Printf("[watch] readdir: %v", err)
+			return
+		}
+
+		for _, e := range entries {
+			// Between each zip: check whether we're shutting down.
+			if shuttingDown.Load() == 1 {
+				log.Println("[watch] shutdown requested, not picking up new zips")
+				return
+			}
+
+			name := e.Name()
+			if e.IsDir() || !strings.HasSuffix(strings.ToLower(name), ".zip") {
+				continue
+			}
+			if _, ok := seen[name]; ok {
+				continue
+			}
+			log.Printf("[watch] new zip: %s", name)
+			seen[name] = struct{}{}
+
+			remotePath := filepath.Join(cfg.SFTPWatchDir, name)
+			localPath := filepath.Join(cfg.LocalDir, name)
+
+			if err := downloadFile(sc, remotePath, localPath); err != nil {
+				log.Printf("[watch] download %s: %v", name, err)
+				delete(seen, name)
+				continue
+			}
+			log.Printf("[watch] downloaded %s → %s", remotePath, localPath)
+
+			// Process the ENTIRE zip — all files, all JSON objects.
+			// Uses hardCtx so it only aborts on the hard deadline.
+			if err := extractLocalZip(hardCtx, localPath, name, lineCh); err != nil {
+				log.Printf("[watch] extract %s: %v", name, err)
+				delete(seen, name)
+				os.Remove(localPath)
+			}
+		}
+	}
+
+	poll()
+	for {
+		select {
+		case <-ctx.Done():
+			log.Println("[watch] stop signal received, finishing current work...")
+			// Do NOT poll for new zips. Any in-flight extractLocalZip has
+			// already returned by now (it runs synchronously in poll()).
+			// Close lineCh so workers know no more data is coming.
+			return
+		case <-ticker.C:
+			poll()
+		}
+	}
+}
+
 // extractLocalZip opens a local zip with zip.OpenReader, then for each file
-// inside calls f.Open() to get a reader and streams JSON objects directly
-// using json.NewDecoder / decoder.More() — no io.ReadAll, no intermediate
-// buffering. Each decoded JSON object is sent as a LineRecord into lineCh.
+// calls f.Open() and streams JSON with json.NewDecoder / decoder.More().
+//
+// On graceful shutdown (hardCtx cancelled): the function will still try to
+// finish the CURRENT file being decoded, then stop processing remaining files
+// in the zip. This ensures no partial file is left half-decoded.
 func extractLocalZip(ctx context.Context, localPath, zipName string, lineCh chan<- LineRecord) error {
 	zr, err := zip.OpenReader(localPath)
 	if err != nil {
@@ -333,16 +355,29 @@ func extractLocalZip(ctx context.Context, localPath, zipName string, lineCh chan
 			continue
 		}
 
+		// Between files: check hard deadline.
+		select {
+		case <-ctx.Done():
+			log.Printf("[extract] hard deadline — stopping after partial zip %s (%s not processed)", zipName, f.Name)
+			return ctx.Err()
+		default:
+		}
+
 		file, err := f.Open()
 		if err != nil {
 			log.Printf("[extract] skip %s/%s: %v", zipName, f.Name, err)
 			continue
 		}
 
+		// Decode the ENTIRE file — all JSON objects — before moving on.
 		n, err := decodeFile(ctx, zipName, f.Name, file, lineCh)
 		file.Close()
 		if err != nil {
-			log.Printf("[extract] decode %s/%s: %v", zipName, f.Name, err)
+			log.Printf("[extract] decode %s/%s after %d objects: %v", zipName, f.Name, n, err)
+			// If the hard context is done, stop processing more files.
+			if ctx.Err() != nil {
+				return ctx.Err()
+			}
 			continue
 		}
 
@@ -351,37 +386,32 @@ func extractLocalZip(ctx context.Context, localPath, zipName string, lineCh chan
 	return nil
 }
 
-// decodeFile streams JSON objects from an io.Reader using json.NewDecoder
-// and decoder.More(). Supports both JSON arrays and NDJSON.
-// Returns the number of objects decoded.
+// decodeFile streams ALL JSON objects from an io.Reader using
+// json.NewDecoder and decoder.More(). It does NOT check ctx between
+// individual objects — it finishes the entire file to avoid partial
+// processing. Only the hard deadline (ctx cancellation) can interrupt it,
+// and that only happens between sends to lineCh.
 func decodeFile(ctx context.Context, zipName, fileName string, file io.Reader, lineCh chan<- LineRecord) (int, error) {
 	decoder := json.NewDecoder(file)
 	lineNo := 0
 
-	// Peek at the first token to detect JSON array vs NDJSON.
 	tok, err := decoder.Token()
 	if err != nil {
 		return 0, fmt.Errorf("read first token: %w", err)
 	}
 
 	if delim, ok := tok.(json.Delim); ok && delim == '[' {
-		// JSON array: '[' already consumed, iterate elements with decoder.More().
 		for decoder.More() {
-			select {
-			case <-ctx.Done():
-				return lineNo, ctx.Err()
-			default:
-			}
-
 			var raw json.RawMessage
 			if err := decoder.Decode(&raw); err != nil {
 				return lineNo, fmt.Errorf("decode object #%d: %w", lineNo+1, err)
 			}
 			lineNo++
 
+			// Send to lineCh; only the hard deadline can interrupt.
 			select {
 			case <-ctx.Done():
-				return lineNo, ctx.Err()
+				return lineNo, fmt.Errorf("hard deadline after %d objects: %w", lineNo, ctx.Err())
 			case lineCh <- LineRecord{
 				ZipName:  zipName,
 				FileName: fileName,
@@ -391,30 +421,10 @@ func decodeFile(ctx context.Context, zipName, fileName string, file io.Reader, l
 			}
 		}
 
-		// Consume closing ']'.
 		if _, err := decoder.Token(); err != nil {
 			return lineNo, fmt.Errorf("read closing bracket: %w", err)
 		}
 	} else {
-		// NDJSON: first token was not '['.
-		// The first token is already consumed (e.g. '{'), so we cannot
-		// re-decode it.  Use decoder.Buffered() to capture what's left
-		// of the first value, then chain a new decoder over the remainder.
-		//
-		// Simpler: since the first token was '{', the decoder has already
-		// started reading the first object.  We decode the rest of it and
-		// then continue with decoder.More() for subsequent objects.
-
-		// We need to get the full first JSON object. Since Token() consumed
-		// only the opening '{', we can still Decode — but Decode expects a
-		// *complete* value and the opening '{' is gone.
-		//
-		// Safest approach: rebuild a decoder from the buffered remainder
-		// prepended with the consumed token.
-		//
-		// For maximum simplicity and per user request, we assume JSON array
-		// format (which is the common case for structured data in zips).
-		// Log a warning for non-array files.
 		log.Printf("[decode] %s/%s: expected JSON array, got token %v — skipping", zipName, fileName, tok)
 	}
 
@@ -422,7 +432,11 @@ func decodeFile(ctx context.Context, zipName, fileName string, file io.Reader, l
 }
 
 // ---------------------------------------------------------------------------
-// Pipeline Stage 3: lineCh → ClickHouse (native batch, 1000 rows)
+// Pipeline Stage 2: lineCh → ClickHouse (native batch, 1000 rows)
+//
+// Graceful shutdown: workers keep consuming from lineCh until it is closed
+// AND fully drained, then flush whatever remains in their buffer.
+// The hard deadline forcefully stops them if the drain takes too long.
 // ---------------------------------------------------------------------------
 
 func insertWorker(
@@ -443,10 +457,14 @@ func insertWorker(
 		if len(buf) == 0 {
 			return
 		}
-		if err := sendBatch(ctx, conn, cfg, buf); err != nil {
-			log.Printf("[worker-%d] batch error (%d rows): %v", id, len(buf), err)
+		// Use a background context for the final flush so it isn't cancelled
+		// by the hard deadline prematurely. ClickHouse batch sends are fast.
+		flushCtx, flushCancel := context.WithTimeout(context.Background(), 10*time.Second)
+		defer flushCancel()
+		if err := sendBatch(flushCtx, conn, cfg, buf); err != nil {
+			log.Printf("[worker-%d] flush error (%d rows): %v", id, len(buf), err)
 		} else {
-			log.Printf("[worker-%d] sent batch of %d rows", id, len(buf))
+			log.Printf("[worker-%d] flushed %d rows", id, len(buf))
 		}
 		buf = buf[:0]
 	}
@@ -454,7 +472,9 @@ func insertWorker(
 	for {
 		select {
 		case <-ctx.Done():
-			// Drain remaining buffered records and flush.
+			// Hard deadline hit. Drain whatever is immediately available
+			// in lineCh, then flush and exit.
+			log.Printf("[worker-%d] hard deadline, draining lineCh...", id)
 			for {
 				select {
 				case rec, ok := <-lineCh:
@@ -477,6 +497,8 @@ func insertWorker(
 
 		case rec, ok := <-lineCh:
 			if !ok {
+				// Channel closed — producer is done. Final flush.
+				log.Printf("[worker-%d] lineCh closed, final flush", id)
 				flush()
 				return
 			}
@@ -490,30 +512,57 @@ func insertWorker(
 
 // ---------------------------------------------------------------------------
 // Main
+//
+// Shutdown flow:
+//   1. SIGINT/SIGTERM → cancel stopCtx
+//   2. watchZips sees stopCtx.Done():
+//      - stops polling for new zips
+//      - finishes the current zip completely (all files, all objects)
+//      - closes lineCh
+//   3. insert workers drain lineCh until closed, flush remaining batches
+//   4. wg.Wait() returns → clean exit
+//   5. If all of the above takes longer than ShutdownTimeout, hardCtx
+//      fires and everything is force-stopped.
 // ---------------------------------------------------------------------------
 
 func main() {
 	cfg := loadConfig()
 
-	// Root context cancelled on SIGINT / SIGTERM.
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
+	// stopCtx: cancelled on signal → stops polling for new zips.
+	stopCtx, stopCancel := context.WithCancel(context.Background())
+	defer stopCancel()
+
+	// hardCtx: fires ShutdownTimeout after signal → force-kills everything.
+	hardCtx, hardCancel := context.WithCancel(context.Background())
+	defer hardCancel()
 
 	sig := make(chan os.Signal, 1)
 	signal.Notify(sig, syscall.SIGINT, syscall.SIGTERM)
 	go func() {
 		s := <-sig
-		log.Printf("[main] signal %v → shutting down", s)
-		cancel()
+		log.Printf("[main] received %v — graceful shutdown (timeout %s)", s, cfg.ShutdownTimeout)
+		shuttingDown.Store(1)
+		stopCancel()
+
+		// Start hard deadline timer.
+		time.AfterFunc(cfg.ShutdownTimeout, func() {
+			log.Println("[main] shutdown timeout exceeded — forcing exit")
+			hardCancel()
+		})
+
+		// Second signal → immediate exit.
+		s = <-sig
+		log.Printf("[main] received %v again — immediate exit", s)
+		os.Exit(1)
 	}()
 
-	// ClickHouse (native protocol).
+	// ClickHouse.
 	conn, err := newClickHouseConn(cfg)
 	if err != nil {
 		log.Fatalf("[main] clickhouse: %v", err)
 	}
 	defer conn.Close()
-	if err := ensureTable(ctx, conn, cfg); err != nil {
+	if err := ensureTable(hardCtx, conn, cfg); err != nil {
 		log.Fatalf("[main] ensure table: %v", err)
 	}
 	log.Println("[main] clickhouse ready")
@@ -527,23 +576,35 @@ func main() {
 	defer sshConn.Close()
 	log.Println("[main] sftp connected")
 
-	// Buffered channel — 2× batch size to keep workers saturated.
-	lineCh := make(chan LineRecord, cfg.LineChannelSize) // default cap=2000
+	// Buffered channel.
+	lineCh := make(chan LineRecord, cfg.LineChannelSize)
 
 	var wg sync.WaitGroup
 
-	// Stage 1: watcher → download → zip.OpenReader → json.NewDecoder → lineCh
-	go watchZips(ctx, cfg, sc, lineCh)
+	// Stage 1: watcher → lineCh
+	// Uses stopCtx to stop polling, hardCtx to force-stop mid-zip.
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		watchZips(stopCtx, hardCtx, cfg, sc, lineCh)
+	}()
 
-	// Stage 2: lineCh → ClickHouse (N workers, 1000-row native batches)
+	// Stage 2: workers drain lineCh → ClickHouse.
+	// Use hardCtx so they force-stop on the hard deadline.
+	var workerWg sync.WaitGroup
 	for i := 0; i < cfg.NumWorkers; i++ {
-		wg.Add(1)
-		go insertWorker(ctx, i, conn, cfg, lineCh, &wg)
+		workerWg.Add(1)
+		go insertWorker(hardCtx, i, conn, cfg, lineCh, &workerWg)
 	}
 
-	log.Printf("[main] pipeline running — poll=%s workers=%d batch=%d lineBuf=%d",
-		cfg.PollInterval, cfg.NumWorkers, cfg.BatchSize, cfg.LineChannelSize)
+	log.Printf("[main] pipeline running — poll=%s workers=%d batch=%d lineBuf=%d timeout=%s",
+		cfg.PollInterval, cfg.NumWorkers, cfg.BatchSize, cfg.LineChannelSize, cfg.ShutdownTimeout)
 
+	// Wait for watcher to finish (it closes lineCh when done).
 	wg.Wait()
-	log.Println("[main] shutdown complete")
+	log.Println("[main] watcher done, waiting for workers to drain lineCh...")
+
+	// Wait for workers to drain and flush.
+	workerWg.Wait()
+	log.Println("[main] all workers done — shutdown complete")
 }
